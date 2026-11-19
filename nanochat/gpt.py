@@ -25,6 +25,15 @@ from nanochat.optim import MuonAdamW
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
 
+# NKIlib RoPE kernel on Trainium, when nki-library is installed. NANOCHAT_NKI_ROPE=0 turns it off.
+import os
+try:
+    from nanochat.nkilib_rope import nkilib_rope
+except ImportError:
+    nkilib_rope = None
+if os.environ.get("NANOCHAT_NKI_ROPE") == "0":
+    nkilib_rope = None
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -98,7 +107,10 @@ class CausalSelfAttention(nn.Module):
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        if nkilib_rope is not None and kv_cache is None and q.device.type == "neuron" and T % 128 == 0:
+            q, k = nkilib_rope(q, k, cos, sin)  # one NKIlib kernel; rope_hf needs T % 128 == 0
+        else:
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2

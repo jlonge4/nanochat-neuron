@@ -1,10 +1,13 @@
 """
-Profile nanochat's RoPE on Trainium to show ATen lowering (eager vs torch.compile).
+Profile nanochat's RoPE on Trainium: ATen lowering (eager vs torch.compile) and the NKIlib kernel.
 
   eager    nanochat.gpt.apply_rotary_emb as-is: every ATen op (slice, mul, neg, add, cat)
            dispatches and runs on the device separately
   compile  the same function under torch.compile(backend="neuron", fullgraph=True):
            one compiled region, one NEFF
+  nkilib   nanochat/nkilib_rope.py on nanochat layouts: NKIlib rope_hf kernel plus the
+           ATen ops that convert cos/sin and transpose q, k into the kernel's (B, H, T, D) layout
+  nkilib_kernel  the rope_hf kernel alone, inputs already in its layout
 
 Shapes match one nanochat d24 attention layer at training length: q and k are
 (B=1, T=2048, H=12, D=128) bf16, cos and sin are (1, T, 1, D/2) as gpt.py builds them.
@@ -13,6 +16,8 @@ Usage (from the repo root, on a Trainium host):
   python -m dev.profile_rope check
   TORCH_NEURONX_NEFF_CACHE_DIR=$(mktemp -d) python -m dev.profile_rope eager   /tmp/prof/eager
   TORCH_NEURONX_NEFF_CACHE_DIR=$(mktemp -d) python -m dev.profile_rope compile /tmp/prof/compile
+  TORCH_NEURONX_NEFF_CACHE_DIR=$(mktemp -d) python -m dev.profile_rope nkilib  /tmp/prof/nkilib
+  TORCH_NEURONX_NEFF_CACHE_DIR=$(mktemp -d) python -m dev.profile_rope nkilib_kernel /tmp/prof/nkilib_kernel
 
 Use an empty NEFF cache for each run. The device profile copies NEFFs from that cache into
 <outdir>/neffs, and Neuron Explorer needs each .neff next to its .ntff. Open <outdir> in
@@ -26,6 +31,7 @@ from torch.profiler import ProfilerActivity
 from torch_neuronx.profiling import NeuronConfig, NeuronProfiler, ProfileMode
 
 from nanochat.gpt import apply_rotary_emb  # nanochat's real implementation
+from nanochat.nkilib_rope import hf_cos_sin, nkilib_rope, rope_hf_op
 
 B, T, H, D = 1, 2048, 12, 128
 torch.manual_seed(0)
@@ -45,7 +51,20 @@ def rope_eager(q, k):
 
 rope_compiled = torch.compile(rope_eager, backend="neuron", fullgraph=True)
 
-VARIANTS = {"eager": rope_eager, "compile": rope_compiled}
+q_bhtd, k_bhtd = q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous()
+cos_hf, sin_hf = hf_cos_sin(cos, sin)
+
+
+def rope_nkilib(q, k):
+    return nkilib_rope(q, k, cos, sin)
+
+
+def rope_nkilib_kernel(q, k):
+    qo, ko = rope_hf_op(q_bhtd, k_bhtd, cos_hf, sin_hf, False)
+    return qo.transpose(1, 2), ko.transpose(1, 2)
+
+
+VARIANTS = {"eager": rope_eager, "compile": rope_compiled, "nkilib": rope_nkilib, "nkilib_kernel": rope_nkilib_kernel}
 
 
 def check():
